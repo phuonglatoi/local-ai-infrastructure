@@ -1,0 +1,32 @@
+# Kong API Gateway Configuration for Supabase
+_format_version: "2.1"
+_transform: true
+
+services:
+  - name: meta
+    url: http://supabase-meta:8080/
+    routes:
+      - name: meta-all
+        strip_path: true
+        paths:
+          - /pg/
+    plugins:
+      - name: key-auth
+        config:
+          hide_credentials: false
+
+  - name: studio
+    url: http://supabase-studio:3000/
+    routes:
+      - name: studio-all
+        strip_path: true
+        paths:
+          - /
+
+consumers:
+  - username: anon
+    keyauth_credentials:
+      - key: ${SUPABASE_ANON_KEY}
+  - username: service_role
+    keyauth_credentials:
+      - key: ${SUPABASE_SERVICE_KEY}

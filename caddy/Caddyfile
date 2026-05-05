@@ -1,0 +1,57 @@
+# =============================================================================
+# Caddyfile - Reverse Proxy Configuration
+# =============================================================================
+# Caddy tu dong cap chung chi SSL/TLS qua Let's Encrypt.
+# Moi subdomain duoc map toi mot Docker service tuong ung.
+#
+# Su dung environment variables de cau hinh domain:
+#   - {$WEBUI_HOSTNAME}     -> Open WebUI (port 8080)
+#   - {$N8N_HOSTNAME}       -> N8N (port 5678)
+#   - {$SUPABASE_HOSTNAME}  -> Supabase Kong (port 8000)
+#   - {$SEARXNG_HOSTNAME}   -> SearXNG (port 8080)
+# =============================================================================
+
+# Open WebUI - AI Chat Interface
+{$WEBUI_HOSTNAME} {
+	reverse_proxy open-webui:8080
+
+	# Security headers
+	header {
+		X-Content-Type-Options nosniff
+		X-Frame-Options SAMEORIGIN
+		Referrer-Policy strict-origin-when-cross-origin
+	}
+}
+
+# N8N - Workflow Automation
+{$N8N_HOSTNAME} {
+	reverse_proxy n8n:5678
+
+	header {
+		X-Content-Type-Options nosniff
+		X-Frame-Options SAMEORIGIN
+		Referrer-Policy strict-origin-when-cross-origin
+	}
+}
+
+# Supabase - Database Dashboard & API
+{$SUPABASE_HOSTNAME} {
+	reverse_proxy supabase-kong:8000
+
+	header {
+		X-Content-Type-Options nosniff
+		X-Frame-Options SAMEORIGIN
+		Referrer-Policy strict-origin-when-cross-origin
+	}
+}
+
+# SearXNG - Private Search Engine
+{$SEARXNG_HOSTNAME} {
+	reverse_proxy searxng:8080
+
+	header {
+		X-Content-Type-Options nosniff
+		X-Frame-Options SAMEORIGIN
+		Referrer-Policy strict-origin-when-cross-origin
+	}
+}

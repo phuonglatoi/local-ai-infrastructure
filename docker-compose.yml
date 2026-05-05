@@ -1,0 +1,319 @@
+###############################################################################
+# LOCAL AI INFRASTRUCTURE - Docker Compose
+# De tai: Container hoa va Truy cap WAN An toan cho He thong Local AI
+#
+# Services:
+#   - Ollama        (LLM Serving)        -> port 11434
+#   - Open WebUI    (Chat Interface)     -> port 8080
+#   - N8N           (Workflow Automation) -> port 5678
+#   - Supabase      (Database/Auth)      -> port 8000
+#   - SearXNG       (Private Search)     -> port 8888
+#   - Caddy         (Reverse Proxy)      -> port 80, 443
+#
+# Usage:
+#   python start_services.py --profile gpu-nvidia
+#   python start_services.py --profile gpu-nvidia --environment public
+#   docker compose --profile gpu-nvidia up -d
+###############################################################################
+
+volumes:
+  n8n_storage:
+  ollama_storage:
+  open-webui:
+  caddy-data:
+  caddy-config:
+  supabase-db:
+  searxng-data:
+
+networks:
+  local-ai-network:
+    driver: bridge
+
+# =============================================================================
+# YAML Anchors (reusable service configurations)
+# =============================================================================
+
+x-n8n: &service-n8n
+  image: n8nio/n8n:latest
+  environment:
+    - DB_TYPE=postgresdb
+    - DB_POSTGRESDB_HOST=supabase-db
+    - DB_POSTGRESDB_PORT=5432
+    - DB_POSTGRESDB_USER=postgres
+    - DB_POSTGRESDB_PASSWORD=${POSTGRES_PASSWORD}
+    - DB_POSTGRESDB_DATABASE=postgres
+    - N8N_DIAGNOSTICS_ENABLED=false
+    - N8N_PERSONALIZATION_ENABLED=false
+    - N8N_ENCRYPTION_KEY=${N8N_ENCRYPTION_KEY}
+    - N8N_USER_MANAGEMENT_JWT_SECRET=${N8N_USER_MANAGEMENT_JWT_SECRET}
+    - WEBHOOK_URL=${N8N_HOSTNAME:+https://}${N8N_HOSTNAME:-http://localhost:5678}
+
+x-ollama: &service-ollama
+  image: ollama/ollama:latest
+  container_name: ollama
+  restart: unless-stopped
+  environment:
+    - OLLAMA_CONTEXT_LENGTH=8192
+    - OLLAMA_FLASH_ATTENTION=1
+    - OLLAMA_KV_CACHE_TYPE=q8_0
+    - OLLAMA_MAX_LOADED_MODELS=2
+  volumes:
+    - ollama_storage:/root/.ollama
+  networks:
+    - local-ai-network
+
+x-init-ollama: &init-ollama
+  image: ollama/ollama:latest
+  container_name: ollama-pull-models
+  volumes:
+    - ollama_storage:/root/.ollama
+  entrypoint: /bin/sh
+  command:
+    - "-c"
+    - "sleep 3; OLLAMA_HOST=ollama:11434 ollama pull qwen2.5:7b-instruct-q4_K_M; OLLAMA_HOST=ollama:11434 ollama pull nomic-embed-text"
+  networks:
+    - local-ai-network
+
+# =============================================================================
+# Services
+# =============================================================================
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # Supabase PostgreSQL Database
+  # ---------------------------------------------------------------------------
+  supabase-db:
+    image: supabase/postgres:15.6.1.143
+    container_name: supabase-db
+    restart: unless-stopped
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB:-postgres}
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_EXP: ${JWT_EXP:-3600}
+    volumes:
+      - supabase-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - local-ai-network
+
+  # ---------------------------------------------------------------------------
+  # Supabase Studio (Dashboard)
+  # ---------------------------------------------------------------------------
+  supabase-studio:
+    image: supabase/studio:20241202-71e5240
+    container_name: supabase-studio
+    restart: unless-stopped
+    environment:
+      STUDIO_PG_META_URL: http://supabase-meta:8080
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      DEFAULT_ORGANIZATION_NAME: Local AI
+      DEFAULT_PROJECT_NAME: local-ai-infrastructure
+      SUPABASE_URL: http://supabase-kong:8000
+      SUPABASE_PUBLIC_URL: ${SUPABASE_PUBLIC_URL:-http://localhost:8000}
+      SUPABASE_ANON_KEY: ${ANON_KEY}
+      SUPABASE_SERVICE_KEY: ${SERVICE_ROLE_KEY}
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://localhost:3000/api/profile', (r) => {if (r.statusCode !== 200) throw new Error(r.statusCode)})"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    depends_on:
+      supabase-db:
+        condition: service_healthy
+    networks:
+      - local-ai-network
+
+  # ---------------------------------------------------------------------------
+  # Supabase Meta
+  # ---------------------------------------------------------------------------
+  supabase-meta:
+    image: supabase/postgres-meta:v0.84.2
+    container_name: supabase-meta
+    restart: unless-stopped
+    environment:
+      PG_META_PORT: 8080
+      PG_META_DB_HOST: supabase-db
+      PG_META_DB_PORT: 5432
+      PG_META_DB_NAME: ${POSTGRES_DB:-postgres}
+      PG_META_DB_USER: postgres
+      PG_META_DB_PASSWORD: ${POSTGRES_PASSWORD}
+    depends_on:
+      supabase-db:
+        condition: service_healthy
+    networks:
+      - local-ai-network
+
+  # ---------------------------------------------------------------------------
+  # Supabase Kong (API Gateway)
+  # ---------------------------------------------------------------------------
+  supabase-kong:
+    image: kong:2.8.1
+    container_name: supabase-kong
+    restart: unless-stopped
+    ports:
+      - "${KONG_HTTP_PORT:-8000}:8000/tcp"
+    environment:
+      KONG_DATABASE: "off"
+      KONG_DECLARATIVE_CONFIG: /home/kong/kong.yml
+      KONG_DNS_ORDER: LAST,A,CNAME
+      KONG_PLUGINS: request-transformer,cors,key-auth,acl,basic-auth
+      KONG_NGINX_PROXY_PROXY_BUFFER_SIZE: 160k
+      KONG_NGINX_PROXY_PROXY_BUFFERS: 64 160k
+      SUPABASE_ANON_KEY: ${ANON_KEY}
+      SUPABASE_SERVICE_KEY: ${SERVICE_ROLE_KEY}
+    volumes:
+      - ./supabase/kong.yml:/home/kong/kong.yml:ro
+    depends_on:
+      supabase-db:
+        condition: service_healthy
+    networks:
+      - local-ai-network
+
+  # ---------------------------------------------------------------------------
+  # Ollama - LLM Serving (GPU NVIDIA)
+  # ---------------------------------------------------------------------------
+  ollama-gpu-nvidia:
+    <<: *service-ollama
+    profiles: ["gpu-nvidia"]
+    expose:
+      - 11434/tcp
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  # ---------------------------------------------------------------------------
+  # Ollama - LLM Serving (GPU AMD)
+  # ---------------------------------------------------------------------------
+  ollama-gpu-amd:
+    <<: *service-ollama
+    profiles: ["gpu-amd"]
+    expose:
+      - 11434/tcp
+    devices:
+      - /dev/kfd
+      - /dev/dri
+
+  # ---------------------------------------------------------------------------
+  # Ollama - LLM Serving (CPU only)
+  # ---------------------------------------------------------------------------
+  ollama-cpu:
+    <<: *service-ollama
+    profiles: ["cpu"]
+    expose:
+      - 11434/tcp
+
+  # ---------------------------------------------------------------------------
+  # Ollama Init - Pull default models
+  # ---------------------------------------------------------------------------
+  ollama-init-gpu-nvidia:
+    <<: *init-ollama
+    profiles: ["gpu-nvidia"]
+    depends_on:
+      - ollama-gpu-nvidia
+
+  ollama-init-gpu-amd:
+    <<: *init-ollama
+    profiles: ["gpu-amd"]
+    depends_on:
+      - ollama-gpu-amd
+
+  ollama-init-cpu:
+    <<: *init-ollama
+    profiles: ["cpu"]
+    depends_on:
+      - ollama-cpu
+
+  # ---------------------------------------------------------------------------
+  # Open WebUI - Chat Interface
+  # ---------------------------------------------------------------------------
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: open-webui
+    restart: unless-stopped
+    ports:
+      - "${WEBUI_PORT:-8080}:8080"
+    environment:
+      - OLLAMA_BASE_URL=http://ollama:11434
+      - WEBUI_AUTH=true
+      - WEBUI_SECRET_KEY=${WEBUI_SECRET_KEY:-secret}
+    volumes:
+      - open-webui:/app/backend/data
+    depends_on:
+      supabase-db:
+        condition: service_healthy
+    networks:
+      - local-ai-network
+
+  # ---------------------------------------------------------------------------
+  # N8N - Workflow Automation
+  # ---------------------------------------------------------------------------
+  n8n:
+    <<: *service-n8n
+    container_name: n8n
+    restart: unless-stopped
+    ports:
+      - "${N8N_PORT:-5678}:5678"
+    volumes:
+      - n8n_storage:/home/node/.n8n
+      - ./n8n/backup:/backup
+    depends_on:
+      supabase-db:
+        condition: service_healthy
+    networks:
+      - local-ai-network
+
+  # ---------------------------------------------------------------------------
+  # SearXNG - Private Search Engine
+  # ---------------------------------------------------------------------------
+  searxng:
+    image: searxng/searxng:latest
+    container_name: searxng
+    restart: unless-stopped
+    ports:
+      - "${SEARXNG_PORT:-8888}:8080"
+    environment:
+      - SEARXNG_BASE_URL=https://${SEARXNG_HOSTNAME:-localhost:8888}/
+    volumes:
+      - searxng-data:/etc/searxng
+      - ./searxng/settings.yml:/etc/searxng/settings.yml:ro
+    networks:
+      - local-ai-network
+
+  # ---------------------------------------------------------------------------
+  # Caddy - Reverse Proxy (Production/Public environment)
+  # ---------------------------------------------------------------------------
+  caddy:
+    image: caddy:2-alpine
+    container_name: caddy
+    restart: unless-stopped
+    profiles: ["public"]
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      - N8N_HOSTNAME=${N8N_HOSTNAME:-n8n.localhost}
+      - WEBUI_HOSTNAME=${WEBUI_HOSTNAME:-ai.localhost}
+      - SUPABASE_HOSTNAME=${SUPABASE_HOSTNAME:-supabase.localhost}
+      - SEARXNG_HOSTNAME=${SEARXNG_HOSTNAME:-search.localhost}
+      - LETSENCRYPT_EMAIL=${LETSENCRYPT_EMAIL:-admin@example.com}
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      - open-webui
+      - n8n
+    networks:
+      - local-ai-network
